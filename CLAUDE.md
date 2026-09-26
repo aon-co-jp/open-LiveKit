@@ -68,5 +68,15 @@ WebRTC SFU/リアルタイム通信基盤。[`open-tv-chat`](https://github.com/
   AIの判断で」を受け、(1)WebRTCスタック=webrtc-rs、(2)水平スケーリング=
   `aruaru-db`+PostgreSQL(2026-09-26ユーザー指示で確定)、(3)シグナリング=
   RPoem GraphQL Subscriptions、(4)Simulcastはフェーズ2見送り、(5)翻訳エンジンは
-  Agentフック方式、を決定。実装(コード)はまだ未着手。次回再開時は
-  [`PORTING.md`](PORTING.md)の「次回再開ポイント」を参照。
+  Agentフック方式、を決定。
+- **2026-09-26 age-outポリシー+利用者端末保存+GraphQLスキーマ初期案**:
+  VPSのHDD空き容量に応じてage-out TTLを6時間→3時間→1時間→30分→5分と段階的に
+  短縮する方針(閾値詳細はAI判断)、通話(録音/録画)・字幕チャット履歴を利用者が
+  希望すれば端末側`aruaru-db`(+希望時PostgreSQLとのDUAL DB)に残せる方針を
+  追加。`RPoem`向けGraphQL Subscriptions/Mutationsの初期スキーマ案
+  (Room/Participant/Track/CaptionEvent等)を作成([`PORTING.md`](PORTING.md)
+  「6. RPoem GraphQL Subscriptionsスキーマ設計」)。設計フェーズはここで
+  一区切りとし、次は小規模な基本部分(スキーマ定義→WebRTC疎通確認→ルーム状態
+  スキーマ→翻訳1言語間の最小構成)から段階的に実装フェーズへ移行する
+  (ユーザー指示)。次回再開時は[`PORTING.md`](PORTING.md)「次回再開ポイント」を
+  参照。
