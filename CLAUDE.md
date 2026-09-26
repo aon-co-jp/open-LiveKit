@@ -41,16 +41,32 @@ WebRTC SFU/リアルタイム通信基盤。[`open-tv-chat`](https://github.com/
 
 ## 技術方針(構想、実装未着手)
 
-- WebRTCスタック: Rust製実装([webrtc-rs](https://github.com/webrtc-rs/webrtc)/
-  [str0m](https://github.com/algesten/str0m)等)を実装着手時に比較検討。
+- WebRTCスタック: **webrtc-rs**(2026-09-26決定。5.2k star・商用実績・1.0に
+  向け安定化中。str0mは将来のパフォーマンス最適化時の代替候補)。
 - サーバーサイド: Rust + [`RPoem`](https://github.com/aon-co-jp/RPoem)
   (Cosmo互換、REST API不要、Tomcat互換)。
-- 水平スケーリング・シグナリングプロトコルの詳細設計: 未着手、実装着手時に
-  Google検索・GitHub調査を経て決定する。
+- 水平スケーリング(ノード状態管理): **`aruaru-db` + PostgreSQLのDUAL DB
+  (VPS高速キャッシュ層)+
+  [`aruaru-db-archive`](https://github.com/aon-co-jp/aruaru-db-archive)
+  (非公開・Git-on-SQL経由の自動バックアップ層)の2層構成**(2026-09-26
+  ユーザー指示で決定。VPSストレージの溢れ防止・利用者端末側の任意ログ保存
+  も含む。Redisは新規依存として追加しない)。
+- シグナリングプロトコル: **RPoemのGraphQL Subscriptions**を軸に設計
+  (gRPC+Protocol Buffersは新規依存として追加しない)。
+- Simulcast: 初期スコープ外(フェーズ2)。
+- 翻訳エンジン統合: 「Agentフック」方式(音声トラック複製→
+  Whisper→MADLAD-400→Piper→翻訳済みトラック再パブリッシュ)。
+  詳細根拠は[`README.md`](README.md)「技術選定の決定事項」、経緯は
+  [`PORTING.md`](PORTING.md)を参照。
 
 ## HANDOFF
 
 - **2026-09-26 リポジトリ新設**: `aon-co-jp/open-LiveKit`を新規作成。
   LiveKitのアーキテクチャ調査(GitHub公式リポジトリ・公式ドキュメント・
-  公式ブログを調査)を`README.md`にまとめた段階。実装は未着手。次回再開時は
+  公式ブログを調査)を`README.md`にまとめた段階。
+- **2026-09-26 技術選定1〜5を決定**: ユーザー指示「1〜5の順で検討、それ以外は
+  AIの判断で」を受け、(1)WebRTCスタック=webrtc-rs、(2)水平スケーリング=
+  `aruaru-db`+PostgreSQL(2026-09-26ユーザー指示で確定)、(3)シグナリング=
+  RPoem GraphQL Subscriptions、(4)Simulcastはフェーズ2見送り、(5)翻訳エンジンは
+  Agentフック方式、を決定。実装(コード)はまだ未着手。次回再開時は
   [`PORTING.md`](PORTING.md)の「次回再開ポイント」を参照。

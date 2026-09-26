@@ -73,6 +73,77 @@ Federation実装)で再実装するWebRTC SFU(Selective Forwarding Unit)/
   参照)を、参加者が発行した音声トラックにフックする形で統合する構想
   (LiveKitのAgentディスパッチ相当の仕組みを自前実装する想定)。
 
+## 技術選定の決定事項(2026-09-26、調査の上でAI判断により決定)
+
+ユーザーより「1〜5の順で検討、それ以外はAIの判断で」との指示を受け、
+GitHub調査に基づき以下の通り決定した。
+
+### 1. WebRTCスタック: webrtc-rs を採用
+
+| 項目 | [webrtc-rs](https://github.com/webrtc-rs/webrtc) | [str0m](https://github.com/algesten/str0m) |
+|---|---|---|
+| スター数 | 5.2k | 627 |
+| ライセンス | MIT OR Apache-2.0 | MIT OR Apache-2.0 |
+| 設計 | フルスタックのWebRTC実装(PeerConnection API相当)、W3C API準拠95%+ | Sans I/O(ネットワークI/Oを外部化した状態機械)、スレッドレス・ロックフリー |
+| 成熟度 | v0.21、1.0に向けて安定化中 | 発展段階、SFU用途を意識した設計だが本番実績は限定的 |
+| 実運用実績 | Recall.ai・Stream Chat・ChannelTalk等がスポンサー(商用利用実績あり) | BitWHIP(CLI WebRTC Agent)等 |
+
+**決定**: 実績・成熟度・コミュニティ規模で優位な**webrtc-rs**を第一候補として
+採用する。str0mのSans I/O設計はSFU実装により適した特性を持つため、
+webrtc-rs採用後にパフォーマンス上の課題が出た場合の代替候補として記録しておく。
+
+### 2. 水平スケーリング設計: `aruaru-db`(高速キャッシュ)+ 自動アーカイブの2層構成(2026-09-26ユーザー指示で確定)
+
+LiveKitはノード間ルーティング状態(ルーム名→ノードIDのマッピング等)をRedisで
+管理しているが、Redisを新規依存として追加せず、**`aruaru-db` + PostgreSQL
+のDUAL DB構成(自社製のCockroachDB×Snowflake×Git-on-SQLハイブリッド分散DBと
+PostgreSQLを並行運用)を軸に、以下の2層構成**を採用する
+(2026-09-26ユーザー指示: 「aruaru-db+PostgreSQLのDUAL DBが基本」)。
+
+- **VPS上の`aruaru-db` + PostgreSQL(DUAL DB・高速キャッシュ層)**: アクティブな
+  ルーム/ノードルーティング状態・直近データのみを短いTTLで保持する。世界中
+  からの大量アクセス時にVPSのストレージが溢れないよう、古いデータは長期
+  保持しない。
+- **[`aruaru-db-archive`](https://github.com/aon-co-jp/aruaru-db-archive)
+  (非公開・自動バックアップ層)**: データが古くなると、`aruaru-db`の
+  Git-on-SQLバージョン管理機能経由で自動的にコミット・pushされるアーカイブ
+  先の新規リポジトリ。VPS側は同期後に古いデータを破棄できるため容量が
+  溢れない。
+- **利用者端末側のオプション保存**: 通話ログ等を、利用者が希望すれば自分の
+  端末側にも保存できる選択肢を用意し、VPS側へ長期データを溜め込まない設計を
+  基本とする。
+
+`aruaru-db`はPostgreSQLワイヤプロトコル互換を志向する自社DBのため、既存の
+PostgreSQLエコシステム(ドライバ・運用知見)を活かせる。リアルタイム用途
+(ノードルーティングの低レイテンシな読み書き)に耐えるか、Git-on-SQL経由の
+自動同期の具体的な実装(同期頻度・age-out判定条件等)は、実装着手時に
+`aruaru-db`側と協調して詳細設計・性能検証する。
+
+### 3. シグナリングプロトコル: RPoem(GraphQL Federation)を軸に設計
+
+LiveKitはgRPC + Protocol Buffersだが、`open-tv-chat`/`open-LiveKit`は
+「REST API不要」を掲げる[`RPoem`](https://github.com/aon-co-jp/RPoem)
+(Cosmo互換GraphQL Federation)を採用済みのため、シグナリング(ルーム参加・
+トラック発行/購読通知等のリアルタイムイベント)は**GraphQL Subscriptionsを
+軸に設計する**方針とする。gRPCは新規依存として追加しない。
+
+### 4. Simulcast(複数解像度レイヤー)対応: 初期スコープ外、フェーズ2で対応
+
+初期実装は単一レイヤー(発行された解像度をそのまま転送)のシンプルな構成とし、
+帯域適応・複数レイヤー同時送信(Simulcast)は初期スコープに含めない
+(実装複雑度が高く、まずSFUの基本機能を成立させることを優先するため)。
+音声品質(帯域が細くても音声翻訳が破綻しないこと)を優先し、映像の
+Simulcastは実装が安定した後のフェーズ2課題とする。
+
+### 5. 翻訳エンジンとの統合方式: 「Agentフック」方式で自前設計
+
+LiveKitのAgentディスパッチ(音声パイプラインへ外部処理をフックする仕組み)を
+参考に、参加者が発行した音声トラックをSFU側でAgent(翻訳パイプライン)へ
+複製配信し、Whisper(ASR)→MADLAD-400(MT)→Piper(TTS)の順で処理した結果を
+「翻訳済み音声トラック」として同じルームに再パブリッシュする方式を採用する
+(詳細は[`open-tv-chat`のPORTING.md](https://github.com/aon-co-jp/open-tv-chat/blob/main/PORTING.md)
+「1. 音声翻訳エンジン調査結果」と合わせて実装着手時に詳細設計する)。
+
 ## 開発方針
 
 このリポジトリの開発ルールは[`open-raid-z`](https://github.com/aon-co-jp/open-raid-z)の
