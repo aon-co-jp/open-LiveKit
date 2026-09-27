@@ -7,3 +7,7 @@ edition = "2024"
 # ローカル開発機ではF:\RPoemを兄弟ディレクトリとしてpathで参照する。
 # CI/他クローン環境ではgitソースに切り替える(実装が進んだ段階で移行)。
 open-runo-federation = { path = "../RPoem/crates/open-runo-federation" }
+# 技術選定1(README.md「技術選定の決定事項」参照): webrtc-rsを採用。
+webrtc = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+bytes = "1.12.1"

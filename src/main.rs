@@ -1,6 +1,7 @@
 mod relay;
 mod resolvers;
 mod schema;
+mod webrtc_probe;
 
 use open_runo_federation::sdl::parse_service_sdl;
 
