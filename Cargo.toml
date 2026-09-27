@@ -1,0 +1,9 @@
+[package]
+name = "open-livekit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# ローカル開発機ではF:\RPoemを兄弟ディレクトリとしてpathで参照する。
+# CI/他クローン環境ではgitソースに切り替える(実装が進んだ段階で移行)。
+open-runo-federation = { path = "../RPoem/crates/open-runo-federation" }

@@ -76,8 +76,15 @@ WebRTC SFU/リアルタイム通信基盤。[`open-tv-chat`](https://github.com/
   希望すれば端末側`aruaru-db`(+希望時PostgreSQLとのDUAL DB)に残せる方針を
   追加。`RPoem`向けGraphQL Subscriptions/Mutationsの初期スキーマ案
   (Room/Participant/Track/CaptionEvent等)を作成([`PORTING.md`](PORTING.md)
-  「6. RPoem GraphQL Subscriptionsスキーマ設計」)。設計フェーズはここで
-  一区切りとし、次は小規模な基本部分(スキーマ定義→WebRTC疎通確認→ルーム状態
-  スキーマ→翻訳1言語間の最小構成)から段階的に実装フェーズへ移行する
-  (ユーザー指示)。次回再開時は[`PORTING.md`](PORTING.md)「次回再開ポイント」を
-  参照。
+  「6. RPoem GraphQL Subscriptionsスキーマ設計」)。
+- **2026-09-27 実装フェーズ1完了**: `cargo`のPATH設定
+  (`%USERPROFILE%\.cargo\bin`)を解決し、`cargo init`でRustプロジェクトを
+  作成。[`src/schema.rs`](src/schema.rs)にGraphQLスキーマ(SDL文字列)、
+  [`src/resolvers.rs`](src/resolvers.rs)に`joinRoom`/`requestTranslation`の
+  最小ダミー実装を追加。`open-runo-federation`(`RPoem`)の
+  `parse_service_sdl`でこのSDLが実際にパースできることを`cargo build`/
+  `cargo run`/`cargo test`で確認済み(3テスト全通過)。`Cargo.toml`の
+  `open-runo-federation`依存は現状ローカルpath依存(`F:\RPoem`、他クローン
+  環境では動かない、後でgit依存へ切替要)。次は「小規模な基本部分から」の
+  方針どおりwebrtc-rs疎通確認へ進む。次回再開時は[`PORTING.md`](PORTING.md)
+  「次回再開ポイント」を参照。

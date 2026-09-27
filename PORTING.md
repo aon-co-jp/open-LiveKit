@@ -1,11 +1,15 @@
 # PORTING (open-LiveKit)
 
-## 現状(2026-09-26)
+## 現状(2026-09-27)
 
-リポジトリ新設直後。LiveKitのアーキテクチャ調査(公式GitHubリポジトリ・
-公式ドキュメント「LiveKit SFU」・公式ブログ「How we built a globally
-distributed mesh network to scale WebRTC」を調査)を`README.md`にまとめた
-段階。コード実装は0行。
+設計ドキュメント一式に加え、**実装フェーズ1が完了**。`cargo init`で
+Rustバイナリプロジェクトを作成し、[`src/schema.rs`](src/schema.rs)に
+GraphQLスキーマ(SDL文字列、型のみ)、[`src/resolvers.rs`](src/resolvers.rs)に
+Mutation一部の最小ダミー実装を作成。`open-runo-federation`
+(`RPoem`のFederation合成エンジン)の`parse_service_sdl`でこのSDLを実際に
+読み込み・型抽出できることをビルド・テスト・実行で確認済み
+(`cargo run`で6型認識、`cargo test`で3テスト全通過)。詳細は下記
+「7. 実装フェーズ1(完了)」を参照。
 
 ## 経緯
 
@@ -126,30 +130,48 @@ type CaptionEvent {
 - 上記はあくまで初期スキーマ案であり、実装着手時に`RPoem`側の実際の
   Federation構成(サブグラフ分割等)に合わせて調整する。
 
+## 7. 実装フェーズ1(完了・2026-09-27)
+
+前回セッション中断時点の課題だった`cargo`PATH未登録は、
+`%USERPROFILE%\.cargo\bin`を前置きすることで解決した
+([`reference_rust_toolchain_env.md`]記憶メモのとおり)。
+
+- `cargo init --name open-livekit`でRustバイナリプロジェクトを作成。
+- [`Cargo.toml`](Cargo.toml): `open-runo-federation`を`path`依存で追加
+  (現状はローカル開発機の兄弟ディレクトリ`F:\RPoem`を直接参照。他クローン
+  環境・CIでは動かないため、実装が進んだ段階でgitソース依存へ切り替える
+  必要がある、と明記した)。
+- [`src/schema.rs`](src/schema.rs): `open-tv-chat/PORTING.md`で設計した
+  GraphQLスキーマ(Room/Participant/Track/CaptionEvent/Mutation/
+  Subscription)をSDL文字列定数`SDL`として実装。`open_runo_federation::sdl::
+  parse_service_sdl`でパースし、6つの型すべてが正しく抽出されることを
+  確認するテストを追加。
+- [`src/resolvers.rs`](src/resolvers.rs): `joinRoom`・`requestTranslation`の
+  最小ダミー実装(実データ接続なし)。`requestTranslation`は`open-tv-chat`の
+  要件どおり「最大10ヶ国語まで」の上限チェックのみ実装・テスト済み。
+- `cargo build`/`cargo run`/`cargo test`いずれも成功
+  (`cargo run`で6型認識、`cargo test`で3テスト全通過)。
+
+**未実施(次フェーズ)**: リゾルバの実配線(RPoemゲートウェイへの実際の登録)、
+webrtc-rsでの疎通確認、`aruaru-db`ルーム状態スキーマ、翻訳エンジン統合は
+まだ着手していない(下記「次回再開ポイント」参照)。
+
 ## 次回再開ポイント
 
-設計フェーズは(1)WebRTCスタック、(2)水平スケーリング(DUAL DB+アーカイブ+
-age-out)、(3)シグナリングスキーマ初期案、(4)Simulcast方針、(5)翻訳エンジン
-統合方式まで一通り出揃った。ユーザー指示により「設計が完成したら小規模な
-基本部分から実装フェーズへ」進める。次回は以下の順で着手する想定:
+「小規模な基本部分から段階的に実装」の方針(ユーザー指示)に沿い、以下の順で
+進める。各ステップ完了後は`cargo test`等で動作確認してから次へ進むこと。
 
-1. 上記6のGraphQLスキーマを`RPoem`上に実際に定義する(型定義のみ、
-   リゾルバは最小限のダミー実装)。
-2. `webrtc-rs`を使った最小限の疎通確認(2プロセス間でPeerConnectionを
-   確立し、ダミー音声トラックを1本転送するだけの最小プロトタイプ)。
-3. 上記1・2が繋がったら、`aruaru-db`側のルーム状態スキーマ(ルームID→
-   ノードID等の最小限のテーブル)を実装する。
-4. 翻訳エンジン(Whisper単体)を1言語間だけAgentフックに接続する最小構成へ
-   拡張する。
-
-「小規模な基本部分から」の方針に沿い、上記1→2→3→4の順で段階的に実装し、
-都度動作確認してから次のステップへ進める。
-
-## セッション中断メモ(2026-09-26、リミットのため停止)
-
-実装フェーズ1(`cargo init`によるRustプロジェクト雛形作成)に着手しようとした
-ところで、この開発機の`cargo`コマンドがPATHに未登録のため実行できなかった
-([`reference_rust_toolchain_env.md`]記憶メモのとおり`%USERPROFILE%\.cargo\bin`
-の前置きが必要)。コード実装は0行のまま。次回セッション再開時は、まず
-`cargo`のPATH設定を確認した上で、上記「次回再開ポイント」の1
-(GraphQLスキーマを`RPoem`上に定義)から着手すること。
+1. **(フェーズ2)`webrtc-rs`での最小疎通確認**: 2プロセス(または2スレッド)間
+   でPeerConnectionを確立し、ダミー音声トラックを1本転送するだけの最小
+   プロトタイプを`open-livekit`内に追加する。まずは`webrtc-rs`の
+   Cargo依存追加とバージョン確認から。
+2. **`aruaru-db`側のルーム状態スキーマ実装**: ルームID→ノードIDの最小限の
+   テーブル定義(`aruaru-db`+PostgreSQLのDUAL DB構成、詳細は上記
+   「2. 水平スケーリング設計」参照)。
+3. **翻訳エンジン(Whisper単体)を1言語間だけAgentフックに接続する最小構成**:
+   `src/resolvers.rs`の`request_translation`ダミー実装を、実際にWhisperの
+   ASR出力(テキスト)を受け取って`CaptionEvent`として返せる最小限の経路に
+   拡張する(MT/TTSはまだ繋がなくて良い、まず1段階ずつ)。
+4. **リゾルバのRPoemゲートウェイへの実配線**: 上記1〜3が個別に動く状態に
+   なったら、`RPoem`側のルーターにこのサブグラフを実際に登録し、
+   GraphQL経由で呼び出せるようにする。
