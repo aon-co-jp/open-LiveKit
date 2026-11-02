@@ -11,3 +11,8 @@ open-runo-federation = { path = "../RPoem/crates/open-runo-federation" }
 webrtc = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 bytes = "1.12.1"
+
+# RUSTSEC-2026-0387(crypto-bigint 0.5)対応: webrtc-dtlsのECDHをp256/p384からringへ差し替えた版。
+# 差分はvendor/webrtc-dtls/PATCHES.mdを参照(上流が追従したら外す)。
+[patch.crates-io]
+webrtc-dtls = { path = "vendor/webrtc-dtls" }
