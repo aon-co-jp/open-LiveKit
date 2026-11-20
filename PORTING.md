@@ -1,0 +1,366 @@
+# PORTING (open-LiveKit)
+
+## 現状(2026-09-27)
+
+設計ドキュメント一式に加え、**実装フェーズ1が完了**。`cargo init`で
+Rustバイナリプロジェクトを作成し、[`src/schema.rs`](src/schema.rs)に
+GraphQLスキーマ(SDL文字列、型のみ)、[`src/resolvers.rs`](src/resolvers.rs)に
+Mutation一部の最小ダミー実装を作成。`open-runo-federation`
+(`RPoem`のFederation合成エンジン)の`parse_service_sdl`でこのSDLを実際に
+読み込み・型抽出できることをビルド・テスト・実行で確認済み
+(`cargo run`で6型認識、`cargo test`で3テスト全通過)。詳細は下記
+「7. 実装フェーズ1(完了)」を参照。
+
+## 経緯
+
+[`open-tv-chat`](https://github.com/aon-co-jp/open-tv-chat)の通話リレー
+サーバー(既定モードで相手にIPを開示しない中継、詳細は
+`open-tv-chat/PORTING.md`「5. アーキテクチャ方針の変遷」参照)に使うSFU技術の
+選定において、既存OSS(LiveKit/mediasoup/Janus/Jitsi Videobridge)と自前実装の
+トレードオフを比較検討した結果、ユーザーから「LiveKitのアーキテクチャを参考に、
+新規リポジトリ`open-LiveKit`としてRust + RPoemで(コード流用せず)一から
+設計・実装したい。じっくり時間をかけて検索・調査した上で進めてほしい」との
+指示を受け、本リポジトリを新設した。
+
+## 1〜5の技術選定 決定事項(2026-09-26)
+
+ユーザーから「1〜5の順で検討、それ以外はAIの判断で」との指示を受け、GitHub
+調査(スター数・活動状況・実運用実績・ライセンス)を行った上で以下を決定した。
+比較表・詳細根拠は[`README.md`](README.md)「技術選定の決定事項」を参照。
+
+1. **WebRTCスタック**: **webrtc-rs**を採用(5.2k star、Recall.ai等の商用実績、
+   1.0に向け安定化中、W3C API準拠95%+)。str0m(627 star、Sans I/O設計)は
+   将来のパフォーマンス最適化時の代替候補として保留。
+2. **水平スケーリング設計**: **`aruaru-db` + PostgreSQLのDUAL DB(VPS高速
+   キャッシュ層)+
+   [`aruaru-db-archive`](https://github.com/aon-co-jp/aruaru-db-archive)
+   (非公開・Git-on-SQL経由の自動バックアップ層)の2層構成**を採用
+   (2026-09-26ユーザー指示で確定: 世界中からの大量アクセス時にVPSの
+   ストレージが溢れないよう、古いデータは自動的にGitHubの専用アーカイブ
+   リポジトリへ退避し、VPS側は直近データのみ短いTTLで保持する。利用者端末
+   側にもログを任意保存できる選択肢を用意)。Redisは新規依存として追加しない。
+   リアルタイム用途での性能検証・同期頻度の詳細設計は実装着手時に`aruaru-db`
+   側と協調して行う。**age-outポリシー(2026-09-26ユーザー指示)**: VPSの
+   HDD空き容量に応じてTTLを6時間→3時間→1時間→30分→5分と段階的に短縮する
+   (2026-09-27追記: 容量枯渇寸前の最危険域として20秒段階を追加、6時間→3時間→
+1時間→30分→5分→20秒。具体的な閾値・監視間隔はAI判断で実装時に詳細化)。**利用者端末側の
+   保存(2026-09-26ユーザー指示)**: 通話(録音/録画)・字幕チャット履歴とも、
+   利用者が希望すれば自分の端末の`aruaru-db`(希望すればPostgreSQLとの
+   DUAL DB)に残せるようにする。
+3. **シグナリングプロトコル**: **RPoem(GraphQL Subscriptions)**を軸に設計。
+   gRPC+Protocol Buffersは新規依存として追加しない。
+4. **Simulcast対応**: 初期スコープ外、単一レイヤー転送から開始しフェーズ2で
+   対応(音声品質・実装の安定を優先)。
+5. **翻訳エンジン統合**: 「Agentフック」方式(参加者の音声トラックを複製配信し、
+   Whisper→MADLAD-400→Piperで処理した結果を翻訳済みトラックとして
+   再パブリッシュ)を採用。
+
+## 6. RPoem GraphQL Subscriptionsスキーマ設計(2026-09-26、設計フェーズ継続)
+
+LiveKitのシグナリング(gRPC+Protocol Buffers)が扱う概念(ルーム参加・退出、
+トラック発行/購読、ルーム状態更新)を、`RPoem`(Cosmo互換GraphQL Federation)
+のGraphQL Subscriptions/Mutationsで再設計した初期スキーマ案。
+
+```graphql
+type Room {
+  id: ID!
+  name: String!
+  participants: [Participant!]!
+  createdAt: DateTime!
+}
+
+type Participant {
+  id: ID!
+  displayName: String!       # 相手に開示する表示名(実名等の自動開示はしない)
+  tracks: [Track!]!
+  connectionMode: ConnectionMode!  # RELAY(既定) or P2P(利用者同意時のみ)
+}
+
+enum ConnectionMode {
+  RELAY
+  P2P
+}
+
+type Track {
+  id: ID!
+  kind: TrackKind!            # AUDIO / VIDEO / TRANSLATED_AUDIO / CAPTION
+  ownerParticipantId: ID!
+  sourceLanguage: String      # 音声トラックの原言語(Agentフックが判定/指定)
+  targetLanguage: String      # TRANSLATED_AUDIO/CAPTIONの場合の翻訳先言語
+}
+
+enum TrackKind {
+  AUDIO
+  VIDEO
+  TRANSLATED_AUDIO
+  CAPTION
+}
+
+type Mutation {
+  joinRoom(roomName: String!, displayName: String!): Participant!
+  leaveRoom(participantId: ID!): Boolean!
+  publishTrack(participantId: ID!, kind: TrackKind!): Track!
+  unpublishTrack(trackId: ID!): Boolean!
+  requestP2PMode(roomId: ID!, participantId: ID!): Boolean!   # 相手の同意待ち
+  respondP2PModeRequest(roomId: ID!, accept: Boolean!): Boolean!
+  requestTranslation(participantId: ID!, targetLanguages: [String!]!): Boolean!
+    # 最大10ヶ国語まで(open-tv-chat要件)
+}
+
+type Subscription {
+  roomStateChanged(roomId: ID!): Room!
+  trackPublished(roomId: ID!): Track!
+  trackUnpublished(roomId: ID!): ID!
+  captionReceived(roomId: ID!, targetLanguage: String!): CaptionEvent!
+}
+
+type CaptionEvent {
+  participantId: ID!
+  targetLanguage: String!
+  text: String!
+  timestamp: DateTime!
+}
+```
+
+- `requestTranslation`は最大10ヶ国語まで同時指定可能とする(`open-tv-chat`の
+  要件)。Agentフック側がこの数だけ翻訳パイプラインを並列起動する想定。
+- `requestP2PMode`/`respondP2PModeRequest`は、既定のRELAYモードから
+  P2Pモードへの切替が双方の同意なしに行われないようにするための最小限の
+  ハンドシェイクを表現したもの(詳細UIは`open-tv-chat`側で設計)。
+- 上記はあくまで初期スキーマ案であり、実装着手時に`RPoem`側の実際の
+  Federation構成(サブグラフ分割等)に合わせて調整する。
+
+## 7. 実装フェーズ1(完了・2026-09-27)
+
+前回セッション中断時点の課題だった`cargo`PATH未登録は、
+`%USERPROFILE%\.cargo\bin`を前置きすることで解決した
+([`reference_rust_toolchain_env.md`]記憶メモのとおり)。
+
+- `cargo init --name open-livekit`でRustバイナリプロジェクトを作成。
+- [`Cargo.toml`](Cargo.toml): `open-runo-federation`を`path`依存で追加
+  (現状はローカル開発機の兄弟ディレクトリ`F:\RPoem`を直接参照。他クローン
+  環境・CIでは動かないため、実装が進んだ段階でgitソース依存へ切り替える
+  必要がある、と明記した)。
+- [`src/schema.rs`](src/schema.rs): `open-tv-chat/PORTING.md`で設計した
+  GraphQLスキーマ(Room/Participant/Track/CaptionEvent/Mutation/
+  Subscription)をSDL文字列定数`SDL`として実装。`open_runo_federation::sdl::
+  parse_service_sdl`でパースし、6つの型すべてが正しく抽出されることを
+  確認するテストを追加。
+- [`src/resolvers.rs`](src/resolvers.rs): `joinRoom`・`requestTranslation`の
+  最小ダミー実装(実データ接続なし)。`requestTranslation`は`open-tv-chat`の
+  要件どおり「最大10ヶ国語まで」の上限チェックのみ実装・テスト済み。
+- `cargo build`/`cargo run`/`cargo test`いずれも成功
+  (`cargo run`で6型認識、`cargo test`で3テスト全通過)。
+
+**未実施(次フェーズ)**: リゾルバの実配線(RPoemゲートウェイへの実際の登録)、
+webrtc-rsでの疎通確認、`aruaru-db`ルーム状態スキーマ、翻訳エンジン統合は
+まだ着手していない(下記「次回再開ポイント」参照)。
+
+## 次回再開ポイント
+
+「小規模な基本部分から段階的に実装」の方針(ユーザー指示)に沿い、以下の順で
+進める。各ステップ完了後は`cargo test`等で動作確認してから次へ進むこと。
+
+1. ~~`webrtc-rs`での最小疎通確認~~ → **2026-09-27完了**、下記
+   「10. 実装フェーズ3」参照。
+2. **`aruaru-db`側のルーム状態スキーマ実装**: ルームID→ノードIDの最小限の
+   テーブル定義(`aruaru-db`+PostgreSQLのDUAL DB構成、詳細は上記
+   「2. 水平スケーリング設計」参照)。
+3. **翻訳エンジン(Whisper単体)を1言語間だけAgentフックに接続する最小構成**:
+   `src/resolvers.rs`の`request_translation`ダミー実装を、実際にWhisperの
+   ASR出力(テキスト)を受け取って`CaptionEvent`として返せる最小限の経路に
+   拡張する(MT/TTSはまだ繋がなくて良い、まず1段階ずつ)。
+4. **リゾルバのRPoemゲートウェイへの実配線**: 上記1〜3が個別に動く状態に
+   なったら、`RPoem`側のルーターにこのサブグラフを実際に登録し、
+   GraphQL経由で呼び出せるようにする。
+5. ~~踏み台の利用アプリ許可リスト機構~~ → **2026-09-27完了**、
+   [`src/relay.rs`](src/relay.rs)の`is_app_allowed`として実装済み。
+6. ~~Hop1/Hop2ノードの定期ランダムローテーション機構~~ → **2026-09-27完了**、
+   [`src/relay.rs`](src/relay.rs)の`NodePool`(`pick`/`rotate`)として
+   実装済み。
+
+## 9. 実装フェーズ2(完了・2026-09-27): 許可リスト+ノードローテーション
+
+[`src/relay.rs`](src/relay.rs)に以下を実装、`cargo test`で7テスト全通過
+(スキーマ3+リゾルバ2+relay4のうち新規4件)。
+
+- `is_app_allowed(app_id: &str) -> bool`: 許可リスト
+  (`open-tv-chat`/`open-english`/`aruaru-tokyo`)にあるapp_idのみ許可。
+  リスト外(任意の一般サイトのURL等)は拒否。
+- `NodePool`: Hop1/Hop2それぞれのノードプール。
+  - `pick(random_unit: f64)`: 呼び出し側が渡す`[0.0, 1.0)`の乱数でプールから
+    1ノードを選ぶ(乱数生成自体は実装のスコープ外とし、テスト容易性を優先)。
+  - `rotate(new_nodes)`: プール内容を丸ごと入れ替える(ローテーション)。
+    通話中セッションは影響を受けない設計(呼び出し時に選んだノードを使い
+    続ける)という前提は、実際のセッション管理実装時に検証が必要。
+
+**未実施(次フェーズ)**: 実際の乱数源(暗号論的に安全なもの)の選定、
+ローテーション間隔の具体的なスケジューリング(cron的な仕組み)、ノード
+プールの配布方式(クライアントがどうプール一覧を取得するか)。
+
+## 10. 実装フェーズ3(完了・2026-09-27): webrtc-rs最小疎通確認
+
+[`src/webrtc_probe.rs`](src/webrtc_probe.rs)に、同一プロセス内で2つの
+`RTCPeerConnection`(pc1=送信側、pc2=受信側)を確立し、ダミーのOpus音声
+トラックを実際に転送する最小プロトタイプを実装。`cargo test`で8テスト
+全通過。
+
+- `webrtc = "0.13"`(technical選定1で決定した`webrtc-rs`)を`Cargo.toml`に
+  追加。
+- pc1・pc2間でICE候補を直接コールバックで橋渡しし(同一プロセス内の疎通
+  確認なのでシグナリングサーバーは介さない)、offer/answerのSDP交換・
+  `on_peer_connection_state_change`での接続状態監視・`on_track`での
+  トラック受信検知を実装。
+- **重要な学び**: 実装中、`Connected`状態への遷移と`on_track`発火を
+  `tokio::sync::Notify`で待つ実装にしたところ、テストは「成功」したが
+  実際にはトラックを受信できていなかった(コールバックが`notified()`の
+  呼び出し前に発火してしまい、通知を取りこぼす競合状態があった)。
+  `AtomicBool`のフラグ+ポーリングに書き直したところ、実際には
+  `on_track`が一度も発火していないことが発覚(webrtc-rsの`on_track`は
+  SDPネゴシエーションだけでは発火せず、実際にRTPパケットが届いて
+  初めて発火する)。接続確立後にダミーサンプルを`TrackLocalStaticSample::
+  write_sample`で書き込み続けるよう修正し、実際にトラックが転送される
+  ことを確認した。**「テストが緑になった」ことを鵜呑みにせず、何を
+  検証しているかを見直す**という教訓を得た。
+
+**未実施(次フェーズ)**: 複数プロセス・複数拠点間での疎通確認、実際の
+音声データ(無音でないサンプル)での転送、STUN/TURNを使った実際のNAT越え。
+
+## 8. 踏み台の用途スコープの検討経緯(2026-09-27、3段階の議論)
+
+ユーザーから「独立したVPNアプリ(`aon-vpn`)も同時開発してはどうか」との
+提案があり、次の順で検討・確定した。
+
+1. 独立VPNアプリ案 → 各国のVPN法規制(完全禁止国・強い規制国・イランの
+   刑事罰化・義務的ログ保持国等)を理由に見送り。
+2. 代替案として「踏み台を`aruaru-vpn`という名前で汎用インターネットアクセス
+   にも拡張する」案を検討 → ユーザーから「名前を変えても実体はVPNと同じで
+   法的リスクは変わらないのでは」との指摘があり、これも撤回。
+3. **最終決定(2026-09-27、さらにユーザーから「設計メモ止まりではなく今すぐ
+   同時に着手してほしい」との追加指示)**: 二段階踏み台は**任意の一般
+   Webサイト等は対象外のまま、`open-tv-chat`・`open-english`・
+   `aruaru-tokyo`等の「aon-co-jpが運営する自社アプリの通信であればどれでも
+   経由できる」共通リレー基盤として、最初から設計・実装する**
+   (Zoom/Discord等と同じ「アプリ固有の通信を運ぶ中継」という法的扱いを
+   維持しつつ、対象アプリの範囲だけを自社アプリ群に広げる形。任意サイトを
+   代理する汎用VPN機能は持たない)。許可リスト(アプリID等)で対象アプリを
+   管理し、リスト外の宛先への中継は拒否する。
+
+詳細は[`README.md`](README.md)「踏み台の用途スコープ」を参照。独立VPNアプリ・
+「aruaru-vpn」という名称での汎用インターネットアクセス拡張構想は撤回済み
+(自社アプリ限定の共通リレー基盤とは別物)。
+
+具体的な実装(TV CHAT専用の踏み台、Hop1/Hop2分離の技術詳細)は次回再開
+ポイント1〜4(webrtc-rs疎通確認等)の中で行う。
+
+## API 方針: REST 全廃・gRPC / Connect へ (2026-11-04)
+
+### 日本語
+- **REST は全廃する。新しい API は REST で作らない。** ブラウザや `curl` から呼ぶ API は **Connect の単純呼び出し**(`POST /<パッケージ>.<Service>/<Method>`、`content-type: application/json`、本文は JSON)、サービス間は **gRPC / gRPC-web**(RPoem の管理API `open_runo.admin.v1.Admin` と同じ流儀)。ストリーミングは、必要になってから。
+- **既存の REST は、触るときに順に移す。** 移したら旧 REST の経路は消す。移行が終わるまで残るが、**新規には追加しない**。
+- **JSON は RS-JSON に統一**する(読み込みは `from_str_secure` / `parse_secure` でサイズ・深さ・重複キーの上限つき、書き出しは `rust_json::fast`)。ブラウザの WASM に `prost` は入れない(サイズが増えるため)。
+- **例外(自分たちの API ではなく、相手の規格が決めているもの)**: ACME、OAuth/OIDC のコールバック、第三者(GitHub など)からの Webhook、ヘルスチェック、静的ファイル配信、OTLP など。これらは規格どおりの HTTP を受ける。
+- 参考実装: `RPoem`(`open_runo.admin.v1.Admin`)、`open-easy-web`(`server/src/connect.rs`、`proto/open_easy_web/admin/v1/admin.proto`)。
+- ※ このリポジトリのコードが既に方針どおりかどうかは、各リポジトリの現状による。この節は方針の記録であり、コードの変更を意味しない。
+
+### English
+- **REST is being abolished. New APIs are not built as REST.** APIs called from browsers or `curl` use **Connect unary calls** (`POST /<package>.<Service>/<Method>`, `content-type: application/json`, JSON body); service-to-service calls use **gRPC / gRPC-web** (the same style as RPoem's admin API `open_runo.admin.v1.Admin`). Streaming only when it is actually needed.
+- **Existing REST endpoints are migrated one by one, when they are touched.** The old REST route is removed once migrated. Until migration is finished they remain, but **no new ones are added**.
+- **JSON is unified on RS-JSON**: reading with `from_str_secure` / `parse_secure` (size, depth and duplicate-key limits), writing with `rust_json::fast`. `prost` is not put into browser WASM (it would grow the binary).
+- **Exceptions (shapes dictated by someone else's standard, not our own API)**: ACME, OAuth/OIDC callbacks, webhooks from third parties (e.g. GitHub), health checks, static file serving, OTLP, and so on. These accept plain HTTP as the standard requires.
+- Reference implementations: `RPoem` (`open_runo.admin.v1.Admin`) and `open-easy-web` (`server/src/connect.rs`, `proto/open_easy_web/admin/v1/admin.proto`).
+- Note: whether the code in a given repository already follows this policy depends on that repository. This section records the policy; it does not mean the code has been changed.
+
+### Deutsch (KI-Übersetzung, redaktionell überarbeitet; noch nicht von Muttersprachlern geprüft)
+- **REST wird vollständig abgeschafft; neue APIs entstehen nicht mehr als REST.** APIs, die aus dem Browser oder per `curl` aufgerufen werden, verwenden **unäre Connect-Aufrufe** (`POST /<Paket>.<Service>/<Methode>`, `content-type: application/json`, JSON-Body). Zwischen Diensten kommen **gRPC bzw. gRPC-web** zum Einsatz, im selben Stil wie die Admin-API von RPoem (`open_runo.admin.v1.Admin`). Streaming wird erst ergänzt, wenn es tatsächlich gebraucht wird.
+- **Bestehende REST-Endpunkte werden schrittweise umgestellt, und zwar immer dann, wenn man ohnehin an ihnen arbeitet.** Sobald ein Endpunkt umgestellt ist, wird die alte REST-Route entfernt. Bis zum Abschluss der Migration bleiben die übrigen bestehen, es werden aber **keine neuen mehr hinzugefügt**.
+- **JSON wird einheitlich über RS-JSON verarbeitet**: Gelesen wird mit `from_str_secure` bzw. `parse_secure` (mit Obergrenzen für Größe, Verschachtelungstiefe und doppelte Schlüssel), geschrieben mit `rust_json::fast`. `prost` wird nicht in das Browser-WASM aufgenommen, da es die Datei vergrößern würde.
+- **Ausnahmen (Schnittstellen, deren Form ein fremder Standard vorgibt und die nicht zu unserer eigenen API gehören)**: ACME, OAuth/OIDC-Callbacks, Webhooks von Drittanbietern (z. B. GitHub), Health-Checks, die Auslieferung statischer Dateien, OTLP und Ähnliches. Diese nehmen, wie vom jeweiligen Standard verlangt, gewöhnliches HTTP entgegen.
+- Referenzimplementierungen: `RPoem` (`open_runo.admin.v1.Admin`) und `open-easy-web` (`server/src/connect.rs`, `proto/open_easy_web/admin/v1/admin.proto`).
+- Hinweis: Ob der Code eines einzelnen Repositorys diese Richtlinie bereits erfüllt, hängt vom jeweiligen Repository ab. Dieser Abschnitt dokumentiert lediglich die Richtlinie; er besagt nicht, dass der Code schon angepasst wurde.
+
+### Русский (перевод выполнен с помощью ИИ и отредактирован; носителями языка пока не проверен)
+- **От REST мы полностью отказываемся; новые API больше не создаются в стиле REST.** API, к которым обращаются из браузера или через `curl`, используют **унарные вызовы Connect** (`POST /<пакет>.<Service>/<Method>`, `content-type: application/json`, тело запроса — JSON). Для взаимодействия между сервисами применяются **gRPC и gRPC-web** — в том же стиле, что и административный API RPoem (`open_runo.admin.v1.Admin`). Потоковая передача данных добавляется лишь тогда, когда в ней действительно возникает необходимость.
+- **Существующие REST-эндпоинты переводятся поэтапно — по мере того, как с ними приходится работать.** После перевода старый REST-маршрут удаляется. Пока миграция не завершена, оставшиеся эндпоинты сохраняются, но **новые не добавляются**.
+- **Работа с JSON унифицирована на основе RS-JSON**: чтение — через `from_str_secure` или `parse_secure` (с ограничениями на размер, глубину вложенности и повторяющиеся ключи), запись — через `rust_json::fast`. `prost` в браузерный WASM не включается, поскольку это увеличило бы размер файла.
+- **Исключения (интерфейсы, форму которых определяет чужой стандарт, а не наш собственный API)**: ACME, обратные вызовы OAuth/OIDC, вебхуки сторонних сервисов (например, GitHub), проверки работоспособности, раздача статических файлов, OTLP и тому подобное. Такие интерфейсы принимают обычный HTTP, как того требует соответствующий стандарт.
+- Эталонные реализации: `RPoem` (`open_runo.admin.v1.Admin`) и `open-easy-web` (`server/src/connect.rs`, `proto/open_easy_web/admin/v1/admin.proto`).
+- Примечание: соответствует ли код конкретного репозитория этой политике, зависит от самого репозитория. Данный раздел лишь фиксирует политику и не означает, что код уже изменён.
+
+## API 方針の補足: 用語の整理と使い分け (2026-11-04)
+
+### 日本語
+**1つに統一するものではなく、別の層の話です。** 「REST の代わり」になるのは Connect・gRPC・GraphQL だけで、WASM は画面を作る技術です。
+
+| 用語 | 何か | REST の代わりか |
+|---|---|---|
+| REST | URL と HTTP メソッドで操作を表す API の作り方 | 全廃する側 |
+| **Connect** | `POST /サービス名/メソッド名` に JSON を送る形式。`curl` でもブラウザの `fetch` でも呼べる | はい(**採用**) |
+| **gRPC** | 同じ「サービス/メソッド」の考え方を、バイナリ(protobuf)と HTTP/2 で行う形式。速く、ストリーミングも得意 | はい(**サービス同士に採用**) |
+| gRPC-web | gRPC のブラウザ向けの変形版 | はい(必要なら) |
+| GraphQL | 欲しい項目を問い合わせる形式 | 一部だけ(**問い合わせ(読み取り)専用**) |
+| WASM | Rust をブラウザの中で動かす仕組み | いいえ(画面を作る技術) |
+
+- **ブラウザの画面や `curl` から呼ぶ API は Connect**(POST、JSON を RS-JSON で読み書き)。ブラウザの WASM は素の gRPC を話せず、Connect なら `fetch` のままで、`prost` を足さずに済む(画面のサイズも増えない)。
+- **サービス同士の通信(サーバー間、重い処理、ストリーミング)は gRPC。** 多くは Connect で足りるので、ストリーミングが必要になった所だけ gRPC に上げる。
+- **GraphQL は、まとめて問い合わせたいときの読み取り専用。** 書き込み(操作)には使わない。
+- **WASM は画面を作る技術として、そのまま使う。** 画面から呼ぶ API が Connect になっただけ。
+- 外部の規格が形を決めるもの(ACME、OAuth のコールバック、第三者の Webhook、ヘルスチェック、静的ファイル、OTLP)は、規格どおりの HTTP のまま。
+- **迷ったら Connect。**
+
+### English
+**These are not alternatives to unify; they sit at different layers.** Only Connect, gRPC and GraphQL can replace REST; WASM is a way to build the UI.
+
+| Term | What it is | Replaces REST? |
+|---|---|---|
+| REST | API style that expresses operations through URLs and HTTP methods | The thing being abolished |
+| **Connect** | `POST /Service/Method` with a JSON body; callable from `curl` and from a browser `fetch` | Yes (**adopted**) |
+| **gRPC** | The same service/method idea over binary (protobuf) and HTTP/2; fast, good at streaming | Yes (**for service-to-service**) |
+| gRPC-web | A browser-friendly variant of gRPC | Yes (if needed) |
+| GraphQL | A query language: ask for exactly the fields you want | Partly (**read-only queries**) |
+| WASM | Runs Rust inside the browser | No (a UI technology) |
+
+- **APIs called from browser screens or `curl` use Connect** (POST, JSON read and written with RS-JSON). Browser WASM cannot speak plain gRPC; with Connect it stays a `fetch`, and `prost` is not needed (the binary does not grow).
+- **Service-to-service calls (server to server, heavy work, streaming) use gRPC.** Connect is enough in most places; move a call to gRPC only where streaming is actually needed.
+- **GraphQL is read-only**, for queries that gather several pieces of data. It is not used for writes (operations).
+- **WASM stays as the way to build the UI.** The API it calls simply became Connect.
+- Interfaces whose shape an outside standard dictates (ACME, OAuth callbacks, third-party webhooks, health checks, static files, OTLP) stay plain HTTP.
+- **When in doubt, use Connect.**
+
+### Deutsch (KI-Übersetzung, sprachlich überarbeitet; noch nicht von Muttersprachlern geprüft)
+**Es geht nicht darum, eine einzige Technik auszuwählen – die Begriffe liegen auf unterschiedlichen Ebenen.** Als Ersatz für REST kommen nur Connect, gRPC und GraphQL in Frage; WASM dagegen ist eine Technik, mit der die Benutzeroberfläche gebaut wird.
+
+| Begriff | Was ist das? | Ersatz für REST? |
+|---|---|---|
+| REST | Ein API-Stil, bei dem Operationen über URLs und HTTP-Methoden ausgedrückt werden | wird abgeschafft |
+| **Connect** | `POST /Dienst/Methode` mit JSON im Body; aufrufbar mit `curl` ebenso wie mit `fetch` im Browser | ja (**gewählt**) |
+| **gRPC** | Dasselbe Prinzip aus Dienst und Methode, aber über binäres protobuf und HTTP/2; schnell und gut für Streaming geeignet | ja (**zwischen Diensten**) |
+| gRPC-web | Eine für den Browser angepasste Variante von gRPC | ja (bei Bedarf) |
+| GraphQL | Abfragesprache, mit der man genau die benötigten Felder anfordert | teilweise (**nur für lesende Abfragen**) |
+| WASM | Führt Rust-Code direkt im Browser aus | nein (Technik für die Oberfläche) |
+
+- **APIs, die von Browseroberflächen oder per `curl` aufgerufen werden, verwenden Connect** (POST; JSON wird mit RS-JSON gelesen und geschrieben). WASM im Browser kann kein reines gRPC sprechen. Mit Connect bleibt es bei einem gewöhnlichen `fetch`, und `prost` ist nicht nötig – die WASM-Datei wird dadurch nicht größer.
+- **Für die Kommunikation zwischen Diensten (Server zu Server, rechenintensive Aufgaben, Streaming) wird gRPC eingesetzt.** In den meisten Fällen reicht Connect aus; auf gRPC wird nur dort umgestellt, wo Streaming tatsächlich gebraucht wird.
+- **GraphQL dient ausschließlich lesenden Abfragen**, wenn mehrere Informationen gebündelt abgefragt werden sollen. Für Schreibzugriffe (Operationen) wird es nicht verwendet.
+- **WASM bleibt die Technik für die Oberfläche.** Geändert hat sich lediglich, dass die aufgerufene API nun auf Connect beruht.
+- Schnittstellen, deren Form durch einen externen Standard festgelegt ist (ACME, OAuth-Callbacks, Webhooks von Drittanbietern, Health-Checks, statische Dateien, OTLP), bleiben gewöhnliches HTTP.
+- **Im Zweifel: Connect.**
+
+### Русский (перевод выполнен с помощью ИИ и литературно отредактирован; носителями языка пока не проверен)
+**Это не варианты, из которых нужно выбрать один, а технологии разных уровней.** Заменить REST могут только Connect, gRPC и GraphQL; WASM же — это способ создания пользовательского интерфейса.
+
+| Термин | Что это | Заменяет REST? |
+|---|---|---|
+| REST | Стиль построения API, при котором операции выражаются через URL и HTTP-методы | отменяется |
+| **Connect** | `POST /Сервис/Метод` с телом в формате JSON; вызывается как из `curl`, так и из браузерного `fetch` | да (**выбран**) |
+| **gRPC** | Тот же принцип «сервис — метод», но поверх двоичного формата protobuf и HTTP/2; работает быстро и хорошо подходит для потоковой передачи | да (**для связи между сервисами**) |
+| gRPC-web | Адаптированный для браузера вариант gRPC | да (при необходимости) |
+| GraphQL | Язык запросов: клиент запрашивает ровно те поля, которые ему нужны | частично (**только запросы на чтение**) |
+| WASM | Позволяет выполнять код на Rust прямо в браузере | нет (технология для интерфейса) |
+
+- **API, которые вызываются из браузерных интерфейсов или через `curl`, строятся на Connect** (POST; JSON читается и записывается через RS-JSON). Браузерный WASM не умеет работать с «чистым» gRPC. С Connect достаточно обычного `fetch`, а `prost` не требуется — размер WASM-файла не увеличивается.
+- **Для обмена между сервисами (сервер — сервер, ресурсоёмкие задачи, потоковая передача) применяется gRPC.** В большинстве случаев достаточно Connect; на gRPC переходят только там, где потоковая передача действительно необходима.
+- **GraphQL используется только для чтения**, когда нужно получить сразу несколько связанных данных. Для записи (операций) он не применяется.
+- **WASM по-прежнему остаётся технологией для интерфейса.** Изменилось лишь то, что вызываемый им API теперь построен на Connect.
+- Интерфейсы, форма которых задана внешним стандартом (ACME, обратные вызовы OAuth, вебхуки сторонних сервисов, проверки работоспособности, статические файлы, OTLP), остаются обычным HTTP.
+- **Если есть сомнения — выбирайте Connect.**
