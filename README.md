@@ -1,3 +1,5 @@
+> Latest translations / 翻訳の最新版: [0-LATEST-TRANSLATIONS.md](0-LATEST-TRANSLATIONS.md)
+
 # open-LiveKit
 
 [LiveKit](https://github.com/livekit/livekit)(Go + Pion製、Apache-2.0)の
